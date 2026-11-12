@@ -1,0 +1,33 @@
+*.iml
+.DS_Store
+
+# Gradle and Kotlin caches / generated outputs
+.gradle/
+.gradle-user-home/
+.kotlin/
+**/build/
+/out/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Machine-specific Android Studio and SDK configuration
+local.properties
+.idea/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+secrets.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*service-account*.json
+
+# Logs
+*.log
