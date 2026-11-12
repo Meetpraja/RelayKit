@@ -402,3 +402,11 @@ val response = RelayKit.client().request("posts/1", HttpMethod.GET) {
 - Use `call<RelayJson>(...)` when you want parsed JSON but do not want to define model classes.
 - Use `GET` and `DELETE` without request bodies; use `POST`, `PUT`, or `PATCH` for JSON, form, and multipart bodies.
 - Configure `INTERNET` permission in the consuming app manifest.
+
+## License
+
+No license has been specified for this project yet. Add the chosen license text in a root-level `LICENSE` file before distributing RelayKit so users know the terms for using and modifying it.
+
+---
+
+Made with ❤️ by **Mit Prajapati**.
