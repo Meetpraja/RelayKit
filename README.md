@@ -169,6 +169,71 @@ The request DSL has equivalent `body(...)`, `header(...)`, and `query(...)` call
 
 RelayKit supports `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`. Its current request API does not accept a body for `GET` or `DELETE`. JSON, form-urlencoded, and multipart bodies are supported with `POST`, `PUT`, and `PATCH`.
 
+## Serialization configuration
+
+RelayKit creates one `Json` instance per client and reuses it for typed response decoding, dynamic JSON parsing, and serializable request bodies. With no custom `Json`, the defaults are `ignoreUnknownKeys = true`, `isLenient = false`, `coerceInputValues = false`, `explicitNulls = false`, and `encodeDefaults = false`. Configure decoding defaults with `serialization(...)`, set request encoding defaults with `encodeDefaults(true)`, or supply a complete kotlinx Serialization `Json` instance with `json(...)`. When a custom instance is supplied, RelayKit uses its settings and `serializersModule` as-is.
+
+For example, register a custom date serializer through the Json serializers module:
+
+```kotlin
+import com.relaykit.network.RelayKit
+import kotlinx.serialization.Contextual
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.modules.SerializersModule
+import kotlinx.serialization.modules.contextual
+import java.text.ParsePosition
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+object ApiDateSerializer : KSerializer<Date> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("ApiDate", PrimitiveKind.STRING)
+    private fun formatter() = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+        isLenient = false
+    }
+    override fun serialize(encoder: Encoder, value: Date) = encoder.encodeString(formatter().format(value))
+    override fun deserialize(decoder: Decoder): Date {
+        val input = decoder.decodeString()
+        val position = ParsePosition(0)
+        return formatter().parse(input, position)?.takeIf { position.index == input.length }
+            ?: throw SerializationException("Invalid API date")
+    }
+}
+
+@Serializable
+data class Invoice(val id: String, @Contextual val dueDate: Date)
+
+RelayKit.init(applicationContext) {
+    baseUrl = "https://api.example.com/"
+    json(Json {
+        serializersModule = SerializersModule {
+            contextual(Date::class, ApiDateSerializer)
+        }
+    })
+}
+```
+
+For APIs that add fields over time, keep unknown fields ignored (the default), or set the policy explicitly:
+
+```kotlin
+RelayKit.init(applicationContext) {
+    baseUrl = "https://api.example.com/"
+    serialization(ignoreUnknownKeys = true)
+}
+```
+
+Set `ignoreUnknownKeys = false` to make an unknown response field a parsing failure. Missing fields with model defaults and nullable fields follow Kotlin Serialization behavior. Invalid JSON, incompatible values, and custom serializer exceptions return `RelayResult.Failure` with `ErrorType.PARSING`; cancellation during decoding propagates. A supplied `Json` instance is retained as client configuration and must not be mutated after initialization. One configured instance is shared across concurrent requests, so custom serializers should be stateless or thread safe.
+
 ## Do I need a model class?
 
 No. A model is optional. Choose the response style that fits your code:
@@ -246,6 +311,81 @@ suspend fun loadPost(): Post? {
 
 The `call<T>` API returns a `RelayResult<T>` rather than throwing for HTTP, network, timeout, or parsing failures. Inspect `Success` and `Failure`, or use `isSuccess`, `statusCode`, `errorType`, `errorOrNull`, and `dataOrNull`. `call<Unit>(...)` is available for successful calls whose response data is not needed.
 
+### Handle structured failures
+
+`RelayResult.Failure.error.type` is an `ErrorType`: `HTTP` includes the server status, `NETWORK` represents connectivity failures, `TIMEOUT` covers connect/read/write/call timeouts, `PARSING` covers invalid or incompatible response data, and `UNKNOWN` is reserved for unexpected failures. Cancellation is not returned as a failure; a cancelled coroutine receives `CancellationException`.
+
+```kotlin
+import com.relaykit.network.error.ErrorType
+
+when (val result = client.call<Post>("posts/1", HttpMethod.GET)) {
+    is RelayResult.Success -> show(result.data)
+    is RelayResult.Failure -> when (result.error.type) {
+        ErrorType.HTTP -> showHttpError(result.statusCode, result.error.message, result.rawBody)
+        ErrorType.NETWORK -> showOfflineMessage()
+        ErrorType.TIMEOUT -> showRetryOption()
+        ErrorType.PARSING -> reportUnexpectedResponse(result.error.cause)
+        ErrorType.UNKNOWN -> reportUnexpectedFailure(result.error.cause)
+        ErrorType.CANCELLED -> Unit // Cancellation is propagated and does not produce Failure.
+    }
+}
+```
+
+`Failure.statusCode` and `Failure.json` expose HTTP status and safely parsed JSON details when available. `Failure.rawBody` retains up to 16 KiB of an error or parsing response body. `Failure.error.cause` provides the original exception for network, timeout, parsing, and unknown failures; its message is not copied into RelayKit's user-facing fallback message.
+
+The raw `client.request(...)` API has a different contract: non-2xx HTTP responses return normally as `TransportResponse` with `isSuccessful == false`, status, headers, and body. Connectivity and other execution exceptions are thrown. The typed `client.call<T>(...)` API converts HTTP, network, timeout, and parsing outcomes into `RelayResult.Failure`. Both APIs are suspending, so coroutine cancellation propagates and cancels an in-flight Retrofit/OkHttp call.
+
+## Response body ownership
+
+RelayKit consumes each OkHttp response body once and closes its source before returning. This applies to successful responses, HTTP error responses, parsing failures, and cancellation. `call<T>(...)` owns that lifecycle and returns parsed data or a `RelayResult`; callers do not receive a live response stream. A `Unit` call accepts an empty successful response, including HTTP 204. Other typed and dynamic JSON calls report an empty successful body as a parsing failure. The raw API returns an empty string for an empty body and preserves status and headers.
+
+`TransportResponse.body` is a fully buffered `String`, so the raw API does not hold an open network resource after it returns. Successful and raw response bodies are not size-limited to preserve existing behavior; large responses therefore require memory proportional to their body size. Failure bodies retained by `RelayResult` are capped at 16 KiB. Typed JSON responses are parsed once into the JSON tree used by both the typed decoder and `RelayResult.json`.
+
+## OkHttp interceptors
+
+Register standard OkHttp application interceptors in the RelayKit configuration block. They are attached once to the shared OkHttp client used by both `request(...)` and `call<T>(...)`:
+
+```kotlin
+import com.relaykit.network.RelayKit
+import okhttp3.Interceptor
+import okhttp3.Response
+
+class TenantHeaderInterceptor(private val tenantId: String) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request().newBuilder()
+            .header("X-Tenant-ID", tenantId)
+            .build()
+        return chain.proceed(request)
+    }
+}
+
+RelayKit.init(applicationContext) {
+    baseUrl = "https://api.example.com/"
+    interceptor(TenantHeaderInterceptor("tenant-42"))
+    interceptor(BearerHeaderInterceptor { secureTokenStore.currentToken })
+}
+```
+
+```kotlin
+class BearerHeaderInterceptor(private val tokenProvider: () -> String?) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = tokenProvider()
+        val request = chain.request().newBuilder().apply {
+            if (token != null) header("Authorization", "Bearer $token")
+        }.build()
+        val response = chain.proceed(request)
+        // Inspect response.code or response.header("X-Request-ID") here as needed.
+        return response
+    }
+}
+```
+
+Interceptors run in registration order on the request path and unwind in reverse order on the response path. They can inspect or modify the OkHttp request before `chain.proceed(request)` and inspect the returned response without consuming its body. RelayKit then consumes and closes the body as described above.
+
+RelayKit reuses each registered interceptor instance for concurrent requests. Treat interceptor fields as shared state: use immutable values or thread-safe storage, and keep request-specific values on the request/response objects. Interceptors are synchronous and cannot be forcibly interrupted while executing arbitrary blocking code; cancellation propagates through `chain.proceed(...)` and cancels its underlying call. `IOException` from an interceptor follows the normal network-error contract (thrown by raw `request`, represented as `NETWORK` by typed `call<T>`); other runtime exceptions become `UNKNOWN` failures for typed calls. `CancellationException` propagates. Transient retries are disabled by default and can be configured as described below; bearer refresh is a separate optional feature.
+
+For bearer authentication that changes over time, use a thread-safe, non-suspending token provider inside an interceptor. The existing `bearer { ... }` configuration remains the supported option when token lookup itself needs to suspend.
+
 ## Configure headers and timeouts
 
 Configure default headers once, then add or override headers on a request:
@@ -287,6 +427,11 @@ RelayKit.init(applicationContext) {
     bearer { secureTokenStore.readAccessToken() }
 }
 
+// Or update the client's in-memory token without recreating it.
+val client = RelayKit.client()
+client.setToken(secureTokenStore.readAccessToken())
+// Call client.setToken(newAccessToken) after login or token rotation.
+
 // Custom auth header or a query-parameter API key.
 val client = RelayKit.client()
 val response = client.request("profile", HttpMethod.GET) {
@@ -296,7 +441,104 @@ val response = client.request("profile", HttpMethod.GET) {
 }
 ```
 
-Per-request `auth(...)` overrides the configured auth. Use `Auth.None` to explicitly disable inherited authentication for one request. `RelayKit.setToken(...)` and `client.setToken(...)` replace the in-memory token used by the no-argument `bearer()` configuration.
+The bearer provider is read for each request, so it can return the latest token; providers may be called concurrently and must be thread safe. The no-argument `bearer()` reads the in-memory token updated by `RelayKit.setToken(...)` or `client.setToken(...)`. With `bearer { ... }`, an explicitly set in-memory token takes precedence over the provider until it is changed again. When automatic bearer auth is active, an explicitly supplied `Authorization` request/default header takes precedence and is sent unchanged. Per-request `auth(...)` overrides the configured auth. Use `Auth.None` to explicitly disable inherited authentication for one request.
+
+Optional refresh runs only after a 401 from a request carrying an automatically supplied bearer token. Register a suspend callback that returns the replacement access token, or `null` if refresh failed:
+
+```kotlin
+RelayKit.init(applicationContext) {
+    baseUrl = "https://api.example.com/"
+    bearer()
+    refreshBearerToken { expiredAccessToken ->
+        // Call your separate refresh service here; return its new access token.
+        authSession.refreshAccessToken(expiredAccessToken)
+    }
+}
+```
+
+`authSession` is application-owned. Its refresh call must use a separate unauthenticated service/client, not this `RelayClient`; RelayKit detects and rejects same-client re-entry to prevent recursive refresh. Concurrent 401 responses for the same token share one suspendable refresh operation. A successful refresh updates the client's in-memory token and retries each waiting original request at most once. A null, blank, or failed refresh returns the original 401 without retrying; 403 never refreshes. Cancellation during token lookup or refresh propagates. Refresh callbacks and token providers can be invoked concurrently with ordinary requests, so their shared state must be thread safe. RelayKit does not log token values or place them in events/errors; Authorization headers are redacted from network logs. RelayKit suppresses its own network logs for RelayClient calls made from inside a refresh callback. Logging performed directly by a third-party client or interceptor remains application controlled.
+
+## Retry policy
+
+Transient retries are disabled by default to preserve the existing one-request behavior. Enable them in the config DSL:
+
+```kotlin
+import com.relaykit.network.RelayKit
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+RelayKit.init(applicationContext) {
+    baseUrl = "https://api.example.com/"
+    retry {
+        enabled = true
+        maxRetries = 2 // two retries after the initial attempt; up to three attempts total
+        initialDelay = 250.milliseconds
+        backoffMultiplier = 2.0
+        maxDelay = 2.seconds
+        jitterFactor = 0.2 // symmetric ±20% jitter
+        retryOnStatusCodes(408, 429, 500, 502, 503, 504)
+        retryNetworkFailures = true
+    }
+}
+```
+
+The default policy values, when enabled, use two retries, 250 ms initial delay, a 2x multiplier, 2 s maximum delay, 20% jitter, network/timeout retries, and status codes 408, 429, 500, 502, 503, and 504. `Retry-After` seconds or HTTP dates are honored for retryable responses and capped by `maxDelay`. Delays use cancellable coroutine suspension. Invalid request configuration and serialization/parsing failures are outside the retry loop. HTTP 401 is reserved for bearer refresh and cannot be added to transient retry codes.
+
+GET is the only method retried by default. PUT, POST, PATCH, and DELETE require `retryNonIdempotentRequests = true`, which explicitly opts into replay risk. For a POST, pair that opt-in with an idempotency key supported by the server:
+
+```kotlin
+import com.relaykit.network.RelayKit
+import com.relaykit.network.request.HttpMethod
+
+val response = RelayKit.client().request("payments", HttpMethod.POST) {
+    header("Idempotency-Key", paymentOperationId)
+    body(paymentPayload)
+}
+```
+
+JSON, form, and multipart field bodies are rebuilt for each attempt. Java `File` attachments are reopened and replayable while the file remains stable; provider-backed content URI attachments are never retried because they may be one-shot. Keep model bodies and file contents stable while a request is in flight. RelayKit disables OkHttp's implicit connection retry so `maxRetries` is the single transient retry limit. Each attempt invokes configured application interceptors again, so interceptor side effects must account for retries. Lifecycle events are emitted once per logical request, not once per attempt. A 401 refresh may make one internal authentication retry; that retry is separate from `maxRetries`, and any subsequent transient failure uses the configured policy.
+
+## Streaming downloads
+
+Use `RelayClient.download` to stream a GET response directly to a destination file. The destination must not already exist; RelayKit preserves it by writing to a sibling `.part` file and moving that file into place only after a successful response. A non-resumable failed or cancelled download removes its partial file. HTTP errors return a `DownloadResponse` with `isSuccessful == false`, status and headers; their bodies are closed without being copied to disk or buffered as text.
+
+```kotlin
+import com.relaykit.network.RelayKit
+import com.relaykit.network.request.DownloadProgress
+import java.io.File
+
+val result = RelayKit.client().download(
+    endpoint = "exports/archive.zip",
+    destination = File(context.cacheDir, "archive.zip"),
+    headers = mapOf("X-Request-Source" to "android"),
+)
+if (result.isSuccessful) {
+    useDownloadedFile(result.destination)
+}
+
+val withProgress = RelayKit.client().download(
+    endpoint = "exports/report.pdf",
+    destination = File(context.cacheDir, "report.pdf"),
+    onProgress = { progress: DownloadProgress ->
+        renderProgress(progress.downloadedBytes, progress.totalBytes, progress.percent)
+    },
+)
+```
+
+Response bytes are copied to disk in a fixed 32 KiB buffer. Progress reports aggregate file bytes, total length when known, and a percentage when the total is positive. Notifications are throttled to 64 KiB increments plus the final update and run asynchronously on a RelayKit background thread. A slow callback can coalesce intermediate updates; callback exceptions are ignored. Keep callbacks short and protect shared state when multiple downloads are active. RelayKit does not log response contents or emit a log line for each chunk.
+
+Cancellation cancels the active OkHttp call, closes the response and file streams, and propagates `CancellationException`. A provider is not involved in downloads. With `resume = false`, partial data is removed after cancellation or failure. Enable resume to retain a sibling `.part` file and send a `Range: bytes=<offset>-` request on the next attempt:
+
+```kotlin
+val resumed = RelayKit.client().download(
+    endpoint = "exports/archive.zip",
+    destination = File(context.cacheDir, "archive.zip"),
+    resume = true,
+    onProgress = { progress -> renderProgress(progress.downloadedBytes, progress.totalBytes, progress.percent) },
+)
+```
+
+Resume requires a server that honors byte ranges with a valid `206 Partial Content` and `Content-Range` starting at the existing partial length. Do not modify the `.part` file while a resumed request is active. A `200 OK` means the server ignored Range, so RelayKit discards the old partial and starts over. `416 Range Not Satisfiable` and malformed or mismatched `Content-Range` return unsuccessful results and preserve the partial file for inspection or another attempt. When enabled, transient network retries use the partial file's current length and validate each returned range before appending; cancellation is never retried. HTTP 401 refresh is handled before any response bytes are written, and the authenticated retry uses the same resume offset. Download requests use the configured headers, authentication, interceptors, timeout settings, logging redaction, and retry policy. The API currently supports GET only and rejects a pre-existing destination rather than overwriting it.
 
 ## Form and multipart requests
 
@@ -324,9 +566,31 @@ val uploadResponse = RelayKit.client().request("upload", HttpMethod.POST) {
         ),
     )
 }
+
+// Multiple files, custom part metadata, and aggregate upload progress
+val multiUpload = RelayKit.client().request("documents", HttpMethod.POST) {
+    multipart(mapOf("category" to "reports", "note" to "quarterly export"))
+    file(RelayFile(name = "primary", file = File(context.cacheDir, "report.pdf"), fileName = "report.pdf", mimeType = "application/pdf"))
+    file(RelayFile(name = "preview", file = File(context.cacheDir, "preview.png"), fileName = "preview.png", mimeType = "image/png"))
+    onUploadProgress { bytesWritten, totalBytes ->
+        // Called asynchronously on a RelayKit background callback thread.
+        updateUploadProgress(bytesWritten, totalBytes)
+    }
+}
+
+// Typed response calls accept the same optional callback parameter.
+val typedUpload = RelayKit.client().call<UploadReceipt>(
+    "documents", HttpMethod.POST,
+    files = listOf(RelayFile("file", File(context.cacheDir, "report.pdf"), mimeType = "application/pdf")),
+    onUploadProgress = { bytesWritten, totalBytes -> updateUploadProgress(bytesWritten, totalBytes) },
+)
 ```
 
-For provider-backed files, pass a content `Uri` to `RelayFile(uri = ...)` instead of a `File`. A multipart request must use `POST`, `PUT`, or `PATCH`. Do not combine JSON, form, and multipart bodies in a single request.
+`File` contents are streamed from disk in bounded chunks; RelayKit does not read the whole upload into a byte array. Content `Uri` sources are opened through the app `ContentResolver` and their streams are closed after each write. The supported upload sources are `File` and content `Uri`; RelayKit does not accept caller-owned `InputStream`s. A content URI can be provider-backed or one-shot, so it is not retried after transient failures or authentication refresh. File-backed bodies are reopened for each allowed retry, but the underlying file must remain stable while the request is in flight.
+
+The optional progress callback reports aggregate multipart body bytes (including boundaries and text fields). `totalBytes` is null when the source length is unknown. Notifications are throttled to roughly 64 KiB increments plus a final update and are queued asynchronously on a dedicated daemon background thread, so callback work does not run on the network writer. A slow callback may cause intermediate updates to be coalesced; the latest queued update is retained. Callback exceptions are ignored. Notifications from a retry start again from zero; queued notifications may arrive just after the response completes. Keep callback work short and thread safe if it shares state with other uploads. Cancellation cancels the OkHttp call and closes active file/URI streams when the transport unwinds; a provider blocked inside its own read may delay cancellation.
+
+A multipart request must use `POST`, `PUT`, or `PATCH`. Do not combine JSON, form, and multipart bodies in a single request. Multipart BODY logs contain part metadata only (field names, filenames, MIME types, and known file lengths); text values and file contents are never logged. Logging does not buffer the upload.
 
 ## Logging during development
 
@@ -341,6 +605,8 @@ logging(
     level = LogLevel.HEADERS,
     sink = LogSink { message -> Log.d("RelayKit", message) },
 )
+redactHeaders("X-Partner-Secret")
+redactQueryParameters("session-id")
 ```
 
 Available levels:
@@ -348,41 +614,27 @@ Available levels:
 | Level | Output |
 | --- | --- |
 | `NONE` | No transport log messages |
-| `BASIC` | Request and response summaries |
+| `BASIC` | Method, sanitized URL, response status, duration, request ID, and attempt number |
 | `HEADERS` | Summaries plus request and response headers |
-| `BODY` | Headers and eligible request/response bodies |
+| `BODY` | Headers and safely redacted JSON request/response bodies |
 
-For body logging during local development, set `level = LogLevel.BODY`. The library redacts common credential keys before sending messages to the sink and limits logged body size (8 KiB by default). Add application-specific sensitive field names with `redact("session_id", "private_value")`. Multipart request bodies are not printed. Keep detailed body logging out of production unless you have reviewed the data being logged.
+Sensitive headers are matched case-insensitively. Defaults include Authorization, Proxy-Authorization, Cookie, Set-Cookie, X-API-Key, and API-Key. Sensitive query names are also matched case-insensitively, including token, access_token, refresh_token, api_key, apikey, password, secret, and client_secret. URL user-info is masked. Add application-specific names with `redactHeaders(...)` and `redactQueryParameters(...)`.
 
-### Pretty-print JSON bodies in Logcat
-
-RelayKit's sink receives readable request/response messages; JSON bodies may be compact. You can format the body portion in your Android log sink with `org.json`:
+For BODY logs, RelayKit redacts common JSON fields such as password, token, accessToken, refreshToken, clientSecret, card number, CVV/CVC, and security-code fields, including inside nested objects and arrays. Add custom JSON field names with `redact("session_id", "private_value")`. Only JSON objects and arrays are logged; malformed JSON, scalar JSON, form bodies, multipart bodies, and unsupported formats are omitted. If a body exceeds `maxLogBodySize` (8 KiB by default), it is omitted with a reason marker. The same limit applies to request and response log output and is separate from response retention. The raw request and response data are not changed. Pretty printing is available with `prettyPrintJsonBodies()`.
 
 ```kotlin
-import android.util.Log
-import com.relaykit.network.logging.LogSink
-import org.json.JSONArray
-import org.json.JSONObject
-
-private fun prettyRelayMessage(message: String): String {
-    val marker = "\nBody: "
-    val bodyStart = message.indexOf(marker)
-    if (bodyStart < 0) return message
-
-    val prefix = message.substring(0, bodyStart)
-    val body = message.substring(bodyStart + marker.length)
-    val prettyBody = runCatching { JSONObject(body).toString(2) }
-        .recoverCatching { JSONArray(body).toString(2) }
-        .getOrDefault(body) // Non-JSON or truncated body: keep the original text.
-    return "$prefix\nBody:\n$prettyBody"
-}
-
-val logSink = LogSink { message ->
-    Log.d("RelayKit", prettyRelayMessage(message))
-}
+logging(
+    level = LogLevel.BODY,
+    sink = LogSink { message -> Log.d("RelayKit", message) },
+    maxBodySize = 4096,
+)
+prettyPrintJsonBodies()
+redact("private_value", "session_id")
+redactHeaders("X-Partner-Secret")
+redactQueryParameters("session-id")
 ```
 
-Pass `logSink` to `logging(level = LogLevel.BODY, sink = logSink, maxBodySize = 4096)` during local development. The formatter only changes display; it does not bypass RelayKit's redaction.
+Logs are emitted for each HTTP attempt. Retry attempts include their attempt number; authentication refresh attempts include `auth_refresh=true`. A logical request still produces one lifecycle event sequence. Requests made through RelayClient from inside a token-refresh callback are not logged by RelayKit. A configured sink may be invoked concurrently and must be thread safe. Sink and formatting exceptions are isolated and do not fail requests. BODY logging is explicit opt-in; prefer NONE, BASIC, or HEADERS in production and do not log sensitive application data. RelayKit formats only the request/response body already used by its transport and never consumes a second response copy for logging.
 
 ## Events and request DSL metadata
 

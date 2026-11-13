@@ -12,7 +12,7 @@ public sealed interface Auth {
         public val placement: ApiKeyPlacement = ApiKeyPlacement.HEADER,
     ) : Auth
 
-    /** Adds a bearer token to the Authorization header. */
+    /** Adds a bearer token to the Authorization header. The provider is read for every request and may be invoked concurrently. */
     public data class Bearer(
         public val tokenProvider: suspend () -> String?,
     ) : Auth

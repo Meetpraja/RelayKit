@@ -45,7 +45,7 @@ afterEvaluate {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.retrofit.core)
-    implementation(libs.okhttp)
+    api(libs.okhttp)
     implementation(libs.serialization.json)
     implementation(libs.retrofit.kotlinx.serialization)
     implementation(libs.coroutines.android)

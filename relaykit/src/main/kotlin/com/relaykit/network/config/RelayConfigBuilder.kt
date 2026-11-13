@@ -7,6 +7,8 @@ import com.relaykit.network.event.RelayEventListener
 import com.relaykit.network.logging.LogLevel
 import com.relaykit.network.logging.LogSink
 import com.relaykit.network.internal.logging.LogRedactor
+import okhttp3.Interceptor
+import kotlinx.serialization.json.Json
 
 /** Mutable DSL used only while constructing a [RelayConfig]. */
 @RelayConfigDsl
@@ -26,21 +28,29 @@ public class RelayConfigBuilder {
     private var emitNulls: Boolean = false
     private var lenient: Boolean = false
     private var coerceValues: Boolean = false
+    private var encodeDefaultValues: Boolean = false
+    private var configuredJson: Json? = null
     private var logLevel: LogLevel = LogLevel.NONE
     private var configuredLogSink: LogSink? = null
     private val configuredRedactions = linkedSetOf<String>()
+    private val configuredHeaderRedactions = linkedSetOf<String>()
+    private val configuredQueryRedactions = linkedSetOf<String>()
     private var bodyLogLimit: Int = 8 * 1024
+    private var prettyPrintBodies: Boolean = false
     private var messageKeys: List<String> = listOf("message", "error_description", "error")
     private val fallbackMessageMap = linkedMapOf<String, String>()
     private var eventCallback: RelayEventListener? = null
     private var eventCapacity: Int = 64
+    private val configuredInterceptors = mutableListOf<Interceptor>()
+    private var tokenRefresher: (suspend (String?) -> String?)? = null
+    private val retryPolicyBuilder = RetryPolicyBuilder()
 
     /** Configure API key authentication. */
     public fun apiKey(value: String, header: String = "X-API-Key"): Unit {
         configuredAuth = Auth.ApiKey(value, header)
     }
 
-    /** Configure bearer authentication with a dynamic token provider. */
+    /** Configure bearer authentication with a dynamic, thread-safe token provider read for each request. */
     public fun bearer(tokenProvider: suspend () -> String?): Unit {
         bearerConfigured = true
         configuredAuth = Auth.Bearer(tokenProvider)
@@ -50,6 +60,19 @@ public class RelayConfigBuilder {
     public fun bearer(): Unit {
         bearerConfigured = true
         configuredAuth = Auth.Bearer { token }
+    }
+
+    /**
+     * Configure an optional single-flight callback to obtain a replacement bearer token after HTTP 401.
+     * Use a separate refresh service; making requests through this RelayClient from the callback is rejected.
+     */
+    public fun refreshBearerToken(refresher: suspend (expiredToken: String?) -> String?): Unit {
+        tokenRefresher = refresher
+    }
+
+    /** Configure transient retries around each complete RelayKit transport attempt. */
+    public fun retry(block: RetryPolicyBuilder.() -> Unit): Unit {
+        retryPolicyBuilder.apply(block)
     }
 
     /** Configure custom authorization. */
@@ -95,6 +118,12 @@ public class RelayConfigBuilder {
         coerceValues = coerceInputValues
     }
 
+    /** Set whether request encoding includes properties whose values equal their model defaults. */
+    public fun encodeDefaults(value: Boolean): Unit { encodeDefaultValues = value }
+
+    /** Use an application-configured Json instance, including its serializers module and all behavior flags. */
+    public fun json(value: Json): Unit { configuredJson = value }
+
     /** Set a logging level name for later logging configuration. */
     public fun loggingLevel(value: LogLevel): Unit { logLevel = value }
 
@@ -111,6 +140,21 @@ public class RelayConfigBuilder {
         require(keys.all(String::isNotBlank)) { "Redaction keys must not be blank" }
         configuredRedactions += keys
     }
+
+    /** Add sensitive request/response header names to the mandatory case-insensitive defaults. */
+    public fun redactHeaders(vararg names: String): Unit {
+        require(names.all(String::isNotBlank)) { "Header redaction names must not be blank" }
+        configuredHeaderRedactions += names
+    }
+
+    /** Add sensitive URL query parameter names to the mandatory case-insensitive defaults. */
+    public fun redactQueryParameters(vararg names: String): Unit {
+        require(names.all(String::isNotBlank)) { "Query redaction names must not be blank" }
+        configuredQueryRedactions += names
+    }
+
+    /** Pretty print valid, redacted JSON bodies in the BODY log level. */
+    public fun prettyPrintJsonBodies(value: Boolean = true): Unit { prettyPrintBodies = value }
 
     /** Configure JSON keys to search for a server error message, in priority order. */
     public fun serverMessageKeys(vararg keys: String): Unit {
@@ -131,6 +175,12 @@ public class RelayConfigBuilder {
         eventCallback = listener
     }
 
+    /**
+     * Register an OkHttp application interceptor in execution order. The same instance is reused
+     * concurrently for requests from this client, so it must be thread safe.
+     */
+    public fun interceptor(interceptor: Interceptor): Unit { configuredInterceptors += interceptor }
+
     internal var token: String? = null
     internal var bearerConfigured: Boolean = false
 
@@ -144,8 +194,12 @@ public class RelayConfigBuilder {
         return RelayConfig(
             baseUrl, configuredAuth, configuredHeaders.toMap(), configuredQuery.toMap(), configuredContentType,
             Timeouts(connectTimeout, readTimeout, writeTimeout, callTimeout), redirects,
-            unknownKeys, emitNulls, lenient, coerceValues, logLevel, configuredLogSink, configuredRedactions.toSet(), bodyLogLimit,
+            unknownKeys, emitNulls, lenient, coerceValues, encodeDefaultValues, configuredJson, logLevel, configuredLogSink,
+            configuredRedactions.toSet(), configuredHeaderRedactions.toSet(), configuredQueryRedactions.toSet(), bodyLogLimit, prettyPrintBodies,
             messageKeys.toList(), fallbackMessageMap.toMap(), eventCallback, eventCapacity,
+            java.util.Collections.unmodifiableList(ArrayList(configuredInterceptors)),
+            tokenRefresher,
+            retryPolicyBuilder.build(),
         )
     }
 }

@@ -15,6 +15,7 @@ public class RequestBuilder internal constructor(
     internal var requestForm: Map<String, String>? = null
     internal var requestMultipart: Map<String, String>? = null
     internal val requestFiles = mutableListOf<RelayFile>()
+    internal var requestUploadProgress: ((bytesWritten: Long, totalBytes: Long?) -> Unit)? = null
     internal var requestTag: String? = null
     internal val requestExtras = linkedMapOf<String, Any?>()
 
@@ -32,6 +33,8 @@ public class RequestBuilder internal constructor(
     public fun multipart(fields: Map<String, String>): Unit { requestMultipart = fields }
     /** Add a multipart file. */
     public fun file(value: RelayFile): Unit { requestFiles += value }
+    /** Observe aggregate request body bytes from the OkHttp background thread. Callback failures are ignored. */
+    public fun onUploadProgress(callback: ((bytesWritten: Long, totalBytes: Long?) -> Unit)?): Unit { requestUploadProgress = callback }
     /** Set a request tag for event correlation. */
     public fun tag(value: String): Unit { requestTag = value }
     /** Add request metadata that is never sent to the server. */
@@ -40,16 +43,42 @@ public class RequestBuilder internal constructor(
     internal fun build(): RelayRequest = RelayRequest(
         endpoint = endpoint,
         method = method,
-        body = requestBody,
-        form = requestForm,
-        multipart = requestMultipart,
+        body = snapshotRequestValue(requestBody),
+        form = requestForm?.toMap(),
+        multipart = requestMultipart?.toMap(),
         files = requestFiles.toList(),
-        query = requestQuery.toMap(),
+        uploadProgress = requestUploadProgress,
+        query = requestQuery.mapValues { snapshotRequestValue(it.value) },
         headers = requestHeaders.toMap(),
         auth = requestAuth,
         tag = requestTag,
-        extras = requestExtras.toMap(),
+        extras = requestExtras.mapValues { snapshotRequestValue(it.value) },
     )
+}
+
+/**
+ * Copy JSON-shaped containers so later caller mutations cannot change an in-flight request.
+ * The caller must not mutate a collection concurrently with this traversal; unsynchronized
+ * concurrent mutation cannot be snapshotted consistently and may throw during iteration.
+ */
+internal fun snapshotRequestValue(value: Any?): Any? = when (value) {
+    is kotlinx.serialization.json.JsonElement -> value
+    is Map<*, *> -> value.entries.associate { (key, item) ->
+        require(key is String) { "JSON object keys must be strings" }
+        key to snapshotRequestValue(item)
+    }
+    is List<*> -> value.map(::snapshotRequestValue)
+    is Set<*> -> value.map(::snapshotRequestValue)
+    is Array<*> -> value.map(::snapshotRequestValue)
+    is BooleanArray -> value.copyOf()
+    is ByteArray -> value.copyOf()
+    is ShortArray -> value.copyOf()
+    is IntArray -> value.copyOf()
+    is LongArray -> value.copyOf()
+    is FloatArray -> value.copyOf()
+    is DoubleArray -> value.copyOf()
+    is CharArray -> value.copyOf()
+    else -> value
 }
 
 /** Marker for request DSL scopes. */

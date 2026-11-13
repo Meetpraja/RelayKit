@@ -26,4 +26,10 @@ internal data class RelayRequest(
     public val tag: String? = null,
     /** Arbitrary request metadata, never transmitted. */
     public val extras: Map<String, Any?> = emptyMap(),
+    /** Correlation identifier assigned by the execution engine for sanitized diagnostic logs. */
+    public val requestId: String? = null,
+    /** Transient transport attempt, starting at one and excluding internal auth refresh calls. */
+    public val retryAttempt: Int = 1,
+    /** Optional aggregate upload callback; invoked on OkHttp's background thread. */
+    public val uploadProgress: ((bytesWritten: Long, totalBytes: Long?) -> Unit)? = null,
 )
